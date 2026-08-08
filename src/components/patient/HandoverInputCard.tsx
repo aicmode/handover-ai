@@ -47,11 +47,18 @@ export function HandoverInputCard({
           placeholder={PLACEHOLDER}
           className="min-h-40 flex-1"
         />
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <VoiceInputButton onAppend={appendTranscript} />
-          <span className="text-[11px] text-fg-muted">
-            {value.length}文字 / 音声データは端末内で処理され保存されません
-          </span>
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <VoiceInputButton onAppend={appendTranscript} />
+            <span className="text-[11px] text-fg-muted">{value.length}文字</span>
+          </div>
+          {/*
+            ブラウザのSpeechRecognition実装によっては、音声がブラウザ／外部の
+            音声認識サービス側で処理される場合がある。実在患者の情報は入力しない。
+          */}
+          <p className="rounded border border-line bg-surface-2 px-2.5 py-1.5 text-[11px] leading-relaxed text-fg-muted">
+            音声入力は本アプリのサーバーへ保存されませんが、ブラウザの実装によっては音声認識がブラウザまたは外部サービス側で処理される場合があります。デモでは架空情報のみ使用してください。
+          </p>
         </div>
       </CardBody>
     </Card>

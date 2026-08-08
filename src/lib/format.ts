@@ -7,6 +7,12 @@ import type {
   Sbar,
 } from "./types";
 
+/** 「なし」等の記載を除き、実際にアレルギーが登録されているか。 */
+export const hasAllergy = (value: string): boolean => {
+  const trimmed = value.trim();
+  return trimmed.length > 0 && !/^(なし|無し|特になし|none)$/i.test(trimmed);
+};
+
 export const genderLabel = (gender: Gender): string =>
   gender === "male" ? "男性" : gender === "female" ? "女性" : "その他";
 
@@ -49,19 +55,22 @@ export const sbarToText = (sbar: Sbar): string =>
 
 export const risksToText = (risks: RiskItem[]): string =>
   risks.length === 0
-    ? "抽出されたリスクはありません。"
-    : risks
-        .map(
+    ? "抽出された確認候補はありません。"
+    : [
+        "※ HIGH / MEDIUM / LOW は申し送り時の確認優先度であり、医学的重症度ではありません。",
+        ...risks.map(
           (risk) =>
             `[${risk.level}] ${risk.category}\n  ${risk.detail}${
-              risk.evidence.length > 0 ? `\n  根拠: ${risk.evidence.join(" / ")}` : ""
+              risk.evidence.length > 0
+                ? `\n  入力情報からの抽出根拠: ${risk.evidence.join(" / ")}`
+                : ""
             }`,
-        )
-        .join("\n");
+        ),
+      ].join("\n");
 
 export const tasksToText = (tasks: NextShiftTask[]): string =>
   tasks.length === 0
-    ? "観察項目はありません。"
+    ? "確認候補はありません。"
     : tasks
         .map((task) => `${task.done ? "[x]" : "[ ]"} (${task.priority}) ${task.label}`)
         .join("\n");
@@ -77,10 +86,10 @@ export const patientToText = (patient: Patient): string =>
     `担当医: ${patient.attendingDoctor}`,
     `担当看護師: ${patient.nurseInCharge}`,
     `ADL: ${patient.adl}`,
-    `アレルギー: ${patient.allergies || "なし"}`,
+    `登録アレルギー: ${patient.allergies || "なし"}`,
     `コードステータス: ${patient.codeStatus}`,
     `感染対策: ${patient.infectionControl}`,
-    `転倒リスク: ${patient.fallRisk}`,
+    `転倒リスク（患者背景）: ${patient.fallRisk}`,
   ].join("\n");
 
 /** 申し送り全文（コピー用） */
@@ -90,8 +99,9 @@ export const fullHandoverToText = (
 ): string =>
   [
     "==============================",
-    "  申し送り（Handover AI 生成）",
+    "  申し送り（Handover AI 生成ドラフト）",
     "==============================",
+    "※ 本文はAIが入力情報を整理した確認前のドラフトです。",
     "",
     "■ 患者基本情報",
     patientToText(patient),
@@ -102,15 +112,16 @@ export const fullHandoverToText = (
     "■ SBAR",
     sbarToText(result.sbar),
     "",
-    "■ リスク・注意事項",
+    "■ 確認優先度（入力情報からの抽出）",
     risksToText(result.risks),
     "",
-    "■ 次勤務への観察項目",
+    "■ 次勤務への観察項目（確認候補）",
     tasksToText(result.tasks),
     "",
     "------------------------------",
     `生成日時: ${formatDateTime(result.generatedAt)}`,
-    "※ AI生成内容は参考情報です。最終的な判断・確認は医療従事者が行ってください。",
+    "※ AI生成内容は参考情報です。AIは診断・治療・看護判断を代替しません。",
+    "※ 最終的な判断・確認は医療従事者が行ってください。",
   ].join("\n");
 
 /** SBAR全文（読み上げ用に記号を減らした形） */

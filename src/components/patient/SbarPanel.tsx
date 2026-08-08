@@ -32,14 +32,14 @@ const SECTIONS: Array<{
     key: "assessment",
     letter: "A",
     title: "Assessment",
-    description: "現在の評価・看護上の問題",
+    description: "入力情報から抽出した確認候補（医学的評価の確定ではありません）",
     accent: "bg-amber-600",
   },
   {
     key: "recommendation",
     letter: "R",
     title: "Recommendation",
-    description: "次勤務で必要な対応・観察",
+    description: "入力済みの医師指示（原文）と、次勤務での確認候補",
     accent: "bg-emerald-700",
   },
 ];
@@ -55,7 +55,7 @@ export function SbarPanel({
     <Card>
       <CardHeader
         title="SBAR"
-        description="各項目は生成後に手動で編集できます。"
+        description="AIが入力情報を整理したドラフトです。各項目は手動で編集できます。"
         icon={<Layers size={16} aria-hidden />}
         actions={
           <CopyButton

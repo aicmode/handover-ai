@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { CheckCircle2, ChevronRight, Clock3 } from "lucide-react";
-import { RiskBadge } from "@/components/ui/RiskBadge";
+import { PRIORITY_LEGEND, RiskBadge } from "@/components/ui/RiskBadge";
 import { genderLabel } from "@/lib/format";
 import { patientRiskLevel } from "@/lib/store";
 import type { HandoverRecord, Patient } from "@/lib/types";
@@ -45,7 +45,9 @@ export function PatientTable({
               <th className="px-3 py-2 font-medium">主病名</th>
               <th className="px-3 py-2 font-medium">担当</th>
               <th className="px-3 py-2 font-medium">申し送り状況</th>
-              <th className="px-3 py-2 font-medium">リスク</th>
+              <th className="px-3 py-2 font-medium" title={PRIORITY_LEGEND}>
+                確認優先度
+              </th>
               <th className="px-3 py-2" />
             </tr>
           </thead>

@@ -4,6 +4,12 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
+  /* sticky なヘッダー／セクションナビの高さ。
+     スクロール位置のオフセット計算をここ一箇所に集約する。 */
+  --header-h: 4rem;
+  --subnav-h: 2.75rem;
+  --sticky-offset: calc(var(--header-h) + var(--subnav-h) + 0.75rem);
+
   --canvas: #eef2f7;
   --surface: #ffffff;
   --surface-2: #f7f9fc;
@@ -64,10 +70,23 @@
 
 html {
   color-scheme: light;
+  /*
+   * スクロールコンテナ（= ビューポート）の上端に sticky ヘッダー分の余白を確保する。
+   * ハッシュ移動・scrollIntoView・フォーカス移動のいずれでも、
+   * 対象がヘッダーとセクションナビの下に隠れないようにするため。
+   * 各セクション側に scroll-margin-top を重ねると二重にオフセットされるので付けない。
+   */
+  scroll-padding-top: var(--sticky-offset);
 }
 
 html.dark {
   color-scheme: dark;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
 }
 
 body {

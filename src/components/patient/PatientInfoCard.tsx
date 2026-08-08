@@ -1,12 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Check, Pencil, UserRound, X } from "lucide-react";
+import { Accordion } from "@/components/ui/Accordion";
 import { Card, CardBody, CardHeader } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Field, Select, TextArea, TextInput } from "@/components/ui/Field";
 import { RiskBadge } from "@/components/ui/RiskBadge";
-import { formatDate, genderLabel, hospitalDay } from "@/lib/format";
+import { formatDate, genderLabel, hasAllergy, hospitalDay } from "@/lib/format";
 import type { CodeStatus, Gender, Patient, RiskLevel } from "@/lib/types";
 
 const GENDER_OPTIONS: Array<{ value: Gender; label: string }> = [
@@ -36,6 +37,38 @@ function ReadRow({ label, value }: { label: string; value: string }) {
   );
 }
 
+/** 申し送りで真っ先に確認したい情報を、目立つ形でまとめて表示する。 */
+function KeyItem({
+  label,
+  children,
+  emphasis,
+}: {
+  label: string;
+  children: ReactNode;
+  emphasis?: boolean;
+}) {
+  return (
+    <div
+      className={
+        emphasis
+          ? "rounded border border-amber-300 bg-amber-50 px-2.5 py-1.5 dark:border-amber-900 dark:bg-amber-950/40"
+          : "rounded border border-line bg-surface-2 px-2.5 py-1.5"
+      }
+    >
+      <p
+        className={
+          emphasis
+            ? "text-[10px] font-semibold uppercase tracking-wide text-amber-800 dark:text-amber-300"
+            : "text-[10px] uppercase tracking-wide text-fg-muted"
+        }
+      >
+        {label}
+      </p>
+      <div className="mt-0.5 text-sm font-medium text-fg">{children}</div>
+    </div>
+  );
+}
+
 export function PatientInfoCard({
   patient,
   onSave,
@@ -60,6 +93,7 @@ export function PatientInfoCard({
   };
 
   const day = hospitalDay(patient.admissionDate);
+  const hasAllergyValue = hasAllergy(patient.allergies);
 
   return (
     <Card>
@@ -189,29 +223,43 @@ export function PatientInfoCard({
             </Field>
           </div>
         ) : (
-          <dl className="grid gap-x-6 sm:grid-cols-2 xl:grid-cols-3">
-            <ReadRow label="氏名" value={`${patient.name}（${patient.nameKana}）`} />
-            <ReadRow
-              label="年齢 / 性別"
-              value={`${patient.age}歳 / ${genderLabel(patient.gender)}`}
-            />
-            <ReadRow label="病室" value={patient.room} />
-            <ReadRow label="患者ID" value={patient.patientCode} />
-            <ReadRow label="主病名" value={patient.primaryDiagnosis} />
-            <ReadRow label="入院日" value={formatDate(patient.admissionDate)} />
-            <ReadRow label="担当医" value={patient.attendingDoctor} />
-            <ReadRow label="担当看護師" value={patient.nurseInCharge} />
-            <ReadRow label="コードステータス" value={patient.codeStatus} />
-            <ReadRow label="ADL" value={patient.adl} />
-            <ReadRow label="アレルギー" value={patient.allergies || "なし"} />
-            <ReadRow label="感染対策" value={patient.infectionControl} />
-            <div className="border-b border-line py-1.5 last:border-b-0">
-              <dt className="text-[11px] text-fg-muted">転倒リスク</dt>
-              <dd className="mt-1">
+          <div className="space-y-3">
+            {/* 重要情報は常に見える位置へ、それ以外は折りたたんで縦の長さを抑える。 */}
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
+              <KeyItem label="氏名">{patient.name}</KeyItem>
+              <KeyItem label="病室">
+                <span className="font-mono">{patient.room}</span>
+              </KeyItem>
+              <KeyItem label="主病名">{patient.primaryDiagnosis}</KeyItem>
+              <KeyItem label="登録アレルギー" emphasis={hasAllergyValue}>
+                {hasAllergyValue ? patient.allergies : "なし"}
+              </KeyItem>
+              <KeyItem label="コードステータス">{patient.codeStatus}</KeyItem>
+              <KeyItem label="転倒リスク（患者背景）">
                 <RiskBadge level={patient.fallRisk} />
-              </dd>
+              </KeyItem>
             </div>
-          </dl>
+
+            <Accordion
+              title="その他の患者情報"
+              description="フリガナ・年齢・患者ID・入院日・担当医・担当看護師・ADL・感染対策"
+              defaultOpen={false}
+            >
+              <dl className="grid gap-x-6 sm:grid-cols-2 xl:grid-cols-3">
+                <ReadRow label="フリガナ" value={patient.nameKana} />
+                <ReadRow
+                  label="年齢 / 性別"
+                  value={`${patient.age}歳 / ${genderLabel(patient.gender)}`}
+                />
+                <ReadRow label="患者ID" value={patient.patientCode} />
+                <ReadRow label="入院日" value={formatDate(patient.admissionDate)} />
+                <ReadRow label="担当医" value={patient.attendingDoctor} />
+                <ReadRow label="担当看護師" value={patient.nurseInCharge} />
+                <ReadRow label="ADL" value={patient.adl} />
+                <ReadRow label="感染対策" value={patient.infectionControl} />
+              </dl>
+            </Accordion>
+          </div>
         )}
       </CardBody>
     </Card>

@@ -5,9 +5,11 @@ import type {
   RiskLevel,
   Sbar,
 } from "../types";
+import { hasAllergy } from "../format";
 import {
   compareLevelDesc,
   extractFacts,
+  isDecreasingSeries,
   matchedKeywords,
   maxLevel,
   type ClinicalFacts,
@@ -16,8 +18,15 @@ import {
 /**
  * モックAIエンジン。
  * APIキー未設定でもデモできるよう、ルールベースで
- * リスク抽出・SBAR・観察項目・要約を生成する。
- * 単語一致だけでなく、数値条件と組み合わせ条件で判定する。
+ * 確認候補の抽出・SBAR・観察項目・要約を生成する。
+ *
+ * 設計方針（医療安全）:
+ * - 診断・治療方針・看護指示を新たに作らない。
+ * - 観察頻度（「4時間ごと」等）や閾値をAI側で決めない。
+ *   閾値は「入力済みの医師指示に書かれている値」だけを引用する。
+ * - HIGH / MEDIUM / LOW は医学的重症度ではなく「申し送り時の確認優先度」。
+ * - 単一の測定値から状態を断定せず、「確認候補」として提示する。
+ * - 時系列（過去値と現在値）を混同しない。
  */
 
 interface RiskDraft {
@@ -39,17 +48,16 @@ const formatJaDate = (iso: string): string => {
 const genderLabel = (gender: HandoverInput["patient"]["gender"]): string =>
   gender === "male" ? "男性" : gender === "female" ? "女性" : "その他";
 
-const hasAllergy = (value: string): boolean => {
-  const trimmed = value.trim();
-  return trimmed.length > 0 && !/^(なし|無し|特になし|none)$/i.test(trimmed);
-};
-
 /* ------------------------------------------------------------------ */
-/* リスク抽出                                                          */
+/* 確認候補の抽出                                                      */
 /* ------------------------------------------------------------------ */
 
-const feverRisk = (facts: ClinicalFacts): RiskDraft | null => {
-  const feverWords = matchedKeywords(facts.text, [
+/**
+ * 体温。
+ * 過去の発熱記録と現在値を混同しないよう、両方を並べて提示する。
+ */
+const temperatureCheck = (facts: ClinicalFacts): RiskDraft | null => {
+  const feverWords = matchedKeywords(facts.observationText, [
     "発熱",
     "熱発",
     "悪寒",
@@ -57,66 +65,121 @@ const feverRisk = (facts: ClinicalFacts): RiskDraft | null => {
     "解熱",
   ]);
   const peak = facts.peakTemperature;
+  const current = facts.currentTemperature;
   if (peak === null && feverWords.length === 0) return null;
 
+  const hasFeverSignal =
+    (peak !== null && peak >= 37.5) || feverWords.length > 0;
+  if (!hasFeverSignal) return null;
+
   const evidence: string[] = [];
-  let level: RiskLevel = "LOW";
-  let detail = "体温の推移に注意が必要です。";
-
-  if (peak !== null && peak >= 38.5) {
-    level = "HIGH";
-    evidence.push(`最高体温 ${peak}℃`);
-    detail = "38.5℃以上の高熱を確認。感染徴候の増悪と再発熱に注意。";
-  } else if (peak !== null && peak >= 38.0) {
-    level = "MEDIUM";
-    evidence.push(`最高体温 ${peak}℃`);
-    detail = "38℃以上の発熱あり。解熱後の再発熱に注意。";
-  } else if (peak !== null && peak >= 37.5) {
-    level = "MEDIUM";
-    evidence.push(`最高体温 ${peak}℃`);
-    detail = "微熱が持続しています。感染徴候の推移を観察。";
-  } else if (feverWords.length > 0) {
-    level = "MEDIUM";
-    detail = "発熱に関する記載があります。体温推移の確認が必要です。";
-  }
-
-  // 平熱かつ発熱に関する記載もない場合はリスクとして扱わない。
-  if (level === "LOW") return null;
-
+  if (peak !== null) evidence.push(`入力された最高体温 ${peak}℃`);
+  if (current !== null) evidence.push(`直近の体温 ${current}℃`);
   if (feverWords.length > 0) evidence.push(`記載: ${feverWords.join("・")}`);
 
+  const orderThreshold = facts.orderThresholds.temperatureAtOrAbove;
+
+  // 確認優先度は「現在の入力値」を基準に決める（過去のピーク値では上げない）。
+  let level: RiskLevel = "MEDIUM";
+  if (current !== null && current >= 38.0) level = "HIGH";
   if (
-    facts.defervescence &&
-    facts.currentTemperature !== null &&
-    facts.currentTemperature < 37.5
+    orderThreshold !== null &&
+    current !== null &&
+    current >= orderThreshold
   ) {
-    detail = `${detail} 現在は${facts.currentTemperature}℃まで解熱していますが、再発熱の可能性があります。`;
-    evidence.push(`現在体温 ${facts.currentTemperature}℃`);
-    if (level === "HIGH") level = "MEDIUM";
+    level = "HIGH";
   }
 
-  return { category: "発熱・再発熱", level, detail, evidence };
-};
+  const parts: string[] = [];
+  if (peak !== null && current !== null && peak - current >= 0.3) {
+    parts.push(
+      `入力に${peak}℃の記録があり、直近の体温は${current}℃です。再発熱の有無を確認してください。`,
+    );
+  } else if (current !== null) {
+    parts.push(`直近の体温は${current}℃です。体温の推移を確認してください。`);
+  } else if (peak !== null) {
+    parts.push(`入力に${peak}℃の記録があります。体温の推移を確認してください。`);
+  } else {
+    parts.push("体温に関する記載があります。体温の推移を確認してください。");
+  }
 
-const spo2Risk = (facts: ClinicalFacts): RiskDraft | null => {
-  if (facts.minSpo2 === null) return null;
-  const value = facts.minSpo2;
-  if (value >= 95) return null;
+  // 閾値はAIが決めず、入力済み医師指示に書かれた表記をそのまま引用する。
+  const orderThresholdText = facts.orderThresholds.temperatureAtOrAboveText;
+  if (orderThresholdText !== null) {
+    parts.push(
+      `入力済みの医師指示に基準の記載があります（${orderThresholdText}℃以上）。基準と入力値の比較を確認してください。`,
+    );
+    evidence.push(`入力済み医師指示の基準 ${orderThresholdText}℃以上`);
+  }
 
-  const level: RiskLevel = value <= 92 ? "HIGH" : "MEDIUM";
   return {
-    category: "SpO2低下",
+    category: "体温・再発熱の確認",
     level,
-    detail:
-      value <= 92
-        ? `SpO2 ${value}% と低下しています。酸素化の悪化に注意し、指示された基準値で医師へ報告してください。`
-        : `SpO2 ${value}% とやや低下傾向です。労作時の低下に注意してください。`,
-    evidence: [`SpO2 ${value}%`],
+    detail: parts.join(""),
+    evidence,
   };
 };
 
-const respiratoryRisk = (facts: ClinicalFacts): RiskDraft | null => {
-  const words = matchedKeywords(facts.text, [
+/**
+ * SpO2。
+ * 単一の測定値からは状態を断定せず、推移・酸素投与・平時値の確認候補として提示する。
+ */
+const spo2Check = (facts: ClinicalFacts): RiskDraft | null => {
+  const min = facts.minSpo2;
+  if (min === null) return null;
+
+  const current = facts.currentSpo2;
+  const series = facts.spo2Series;
+  const threshold = facts.orderThresholds.spo2Below;
+  const belowOrder =
+    threshold !== null && current !== null && current < threshold;
+
+  if (min >= 95 && !belowOrder) return null;
+
+  let level: RiskLevel = "MEDIUM";
+  if (min <= 92) level = "HIGH";
+  if (belowOrder) level = "HIGH";
+
+  const evidence: string[] = [];
+  if (series.length > 0) evidence.push(`記載順のSpO2 ${series.join("% → ")}%`);
+  if (current !== null) evidence.push(`入力されたSpO2 ${current}%`);
+
+  const parts: string[] = [];
+  if (series.length >= 2) {
+    parts.push(
+      `入力に記載されたSpO2は記載順に${series.join("% → ")}%です。${
+        isDecreasingSeries(series, 2)
+          ? "記載順では低下しています。測定条件と酸素投与の有無を含めて推移を確認してください。"
+          : "測定条件と酸素投与の有無を含めて推移を確認してください。"
+      }`,
+    );
+  } else {
+    parts.push(
+      `入力されたSpO2は${current ?? min}%です。単一の測定値のため、推移・酸素投与の有無・平時値を確認してください。`,
+    );
+  }
+
+  // 閾値はAIが決めず、入力済み医師指示に書かれた表記をそのまま引用する。
+  const thresholdText = facts.orderThresholds.spo2BelowText;
+  if (thresholdText !== null) {
+    parts.push(
+      current !== null
+        ? `入力済みの医師指示に基準の記載があります（${thresholdText}%未満）。現在値${current}%と基準${thresholdText}%未満の比較を確認してください。`
+        : `入力済みの医師指示に基準の記載があります（${thresholdText}%未満）。基準と入力値の比較を確認してください。`,
+    );
+    evidence.push(`入力済み医師指示の基準 ${thresholdText}%未満`);
+  }
+
+  return {
+    category: "SpO2値・推移の確認",
+    level,
+    detail: parts.join(""),
+    evidence,
+  };
+};
+
+const respiratoryCheck = (facts: ClinicalFacts): RiskDraft | null => {
+  const words = matchedKeywords(facts.observationText, [
     "呼吸困難",
     "息切れ",
     "喘鳴",
@@ -137,7 +200,11 @@ const respiratoryRisk = (facts: ClinicalFacts): RiskDraft | null => {
   let level: RiskLevel = "LOW";
   if (rrAbnormal) level = "HIGH";
   else if (rrBorderline) level = "MEDIUM";
-  if (words.some((word) => ["呼吸困難", "努力呼吸", "陥没呼吸", "起座呼吸"].includes(word))) {
+  if (
+    words.some((word) =>
+      ["呼吸困難", "努力呼吸", "陥没呼吸", "起座呼吸"].includes(word),
+    )
+  ) {
     level = maxLevel(level, "HIGH");
   } else if (words.length > 0) {
     level = maxLevel(level, "MEDIUM");
@@ -148,21 +215,16 @@ const respiratoryRisk = (facts: ClinicalFacts): RiskDraft | null => {
   if (words.length > 0) evidence.push(`記載: ${words.join("・")}`);
 
   return {
-    category: "呼吸状態悪化",
+    category: "呼吸状態の変化に関する確認",
     level,
     detail:
-      level === "HIGH"
-        ? "呼吸状態の悪化が疑われます。呼吸数・呼吸音・努力呼吸の有無を頻回に観察してください。"
-        : "呼吸状態の変化に注意が必要です。労作時の症状と呼吸音を観察してください。",
+      "呼吸に関する記載・数値が入力されています。呼吸数・呼吸音・努力呼吸の有無と、入力済み医師指示の実施状況を確認してください。",
     evidence,
   };
 };
 
-const fallRisk = (
-  facts: ClinicalFacts,
-  input: HandoverInput,
-): RiskDraft | null => {
-  const unsteady = matchedKeywords(facts.text, [
+const fallCheck = (facts: ClinicalFacts, input: HandoverInput): RiskDraft | null => {
+  const unsteady = matchedKeywords(facts.observationText, [
     "ふらつき",
     "ふらふら",
     "めまい",
@@ -172,7 +234,7 @@ const fallRisk = (
     "歩行不安定",
     "バランス",
   ]);
-  const nightMobility = matchedKeywords(facts.text, [
+  const nightMobility = matchedKeywords(facts.observationText, [
     "夜間トイレ",
     "夜間排尿",
     "夜間",
@@ -181,7 +243,7 @@ const fallRisk = (
     "離床センサー",
     "中途覚醒",
   ]);
-  const sedation = matchedKeywords(facts.text, [
+  const sedation = matchedKeywords(facts.observationText, [
     "眠剤",
     "睡眠薬",
     "せん妄",
@@ -191,11 +253,7 @@ const fallRisk = (
   ]);
   const baseline = input.patient.fallRisk;
 
-  if (
-    unsteady.length === 0 &&
-    nightMobility.length === 0 &&
-    baseline === "LOW"
-  ) {
+  if (unsteady.length === 0 && nightMobility.length === 0 && baseline === "LOW") {
     return null;
   }
 
@@ -211,21 +269,21 @@ const fallRisk = (
   const evidence: string[] = [`患者背景の転倒リスク: ${baseline}`];
   if (unsteady.length > 0) evidence.push(`記載: ${unsteady.join("・")}`);
   if (nightMobility.length > 0) evidence.push(`夜間行動: ${nightMobility.join("・")}`);
-  if (sedation.length > 0) evidence.push(`鎮静系: ${sedation.join("・")}`);
+  if (sedation.length > 0) evidence.push(`鎮静系の記載: ${sedation.join("・")}`);
 
   return {
-    category: "転倒リスク",
+    category: "転倒関連の確認",
     level,
     detail:
       level === "HIGH"
-        ? "ふらつきと夜間の移動が重なっており、転倒の危険が高い状態です。夜間はナースコール徹底と付き添いを検討してください。"
-        : "移動時の転倒に注意が必要です。環境整備と履物の確認を行ってください。",
+        ? "ふらつきと夜間の移動に関する記載が重なっています。現在実施されている転倒予防対策の内容と、移動・歩行時の状態を確認してください。"
+        : "移動に関する記載があります。現在実施されている転倒予防対策の内容と、移動・歩行時の状態を確認してください。",
     evidence,
   };
 };
 
-const intakeRisk = (facts: ClinicalFacts): RiskDraft | null => {
-  const words = matchedKeywords(facts.text, [
+const intakeCheck = (facts: ClinicalFacts): RiskDraft | null => {
+  const words = matchedKeywords(facts.observationText, [
     "食欲低下",
     "摂取不良",
     "食事拒否",
@@ -239,7 +297,7 @@ const intakeRisk = (facts: ClinicalFacts): RiskDraft | null => {
   let level: RiskLevel = "LOW";
   const evidence: string[] = [];
   if (fraction !== null) {
-    evidence.push(`食事摂取量 ${fraction}割`);
+    evidence.push(`入力された食事摂取量 ${fraction}割`);
     if (fraction <= 3) level = "HIGH";
     else if (fraction <= 5) level = "MEDIUM";
   }
@@ -250,22 +308,21 @@ const intakeRisk = (facts: ClinicalFacts): RiskDraft | null => {
   if (level === "LOW") return null;
 
   return {
-    category: "食事摂取低下",
+    category: "食事摂取量の確認",
     level,
     detail:
-      level === "HIGH"
-        ? "摂取量が著明に低下しています。必要栄養量の確保と、医師への報告を検討してください。"
-        : "食事摂取量が低下しています。毎食の摂取量を記録し、経過を確認してください。",
+      "入力された食事摂取量が少なめに記載されています。摂取量の経過と、入力済みの食事形態・医師指示に関する記載を確認してください。",
     evidence,
   };
 };
 
-const dehydrationRisk = (
+/** 「脱水」と断定せず、水分出納に関する確認候補として提示する。 */
+const fluidBalanceCheck = (
   facts: ClinicalFacts,
-  feverLevel: RiskLevel | null,
+  temperatureLevel: RiskLevel | null,
   intakeLevel: RiskLevel | null,
 ): RiskDraft | null => {
-  const words = matchedKeywords(facts.text, [
+  const words = matchedKeywords(facts.observationText, [
     "脱水",
     "口渇",
     "皮膚乾燥",
@@ -275,7 +332,7 @@ const dehydrationRisk = (
   const fluid = facts.fluidMl;
   const lowFluid = fluid !== null && fluid < 800;
 
-  if (!lowFluid && words.length === 0 && !(feverLevel && intakeLevel)) {
+  if (!lowFluid && words.length === 0 && !(temperatureLevel && intakeLevel)) {
     return null;
   }
 
@@ -283,30 +340,29 @@ const dehydrationRisk = (
   const evidence: string[] = [];
   if (lowFluid) {
     level = "MEDIUM";
-    evidence.push(`水分摂取量 約${fluid}ml`);
+    evidence.push(`入力された水分摂取量 約${fluid}ml`);
   }
   if (words.length > 0) {
     level = maxLevel(level, "MEDIUM");
     evidence.push(`記載: ${words.join("・")}`);
   }
-  if (feverLevel && intakeLevel) {
+  if (temperatureLevel && intakeLevel) {
     level = maxLevel(level, "MEDIUM");
-    evidence.push("発熱と摂取量低下の併存");
+    evidence.push("体温に関する記載と摂取量低下の記載が併存");
   }
-  if (lowFluid && feverLevel === "HIGH") level = "HIGH";
   if (level === "LOW") return null;
 
   return {
-    category: "脱水",
+    category: "水分出納の確認",
     level,
     detail:
-      "水分出納バランスの悪化が疑われます。飲水量・尿量・皮膚や口腔の乾燥を観察してください。",
+      "水分・食事摂取量に関する記載があります。飲水量・尿量・口腔や皮膚の乾燥所見の記録を確認してください。脱水の有無は入力情報だけでは判断できません。",
     evidence,
   };
 };
 
-const urineRisk = (facts: ClinicalFacts): RiskDraft | null => {
-  const words = matchedKeywords(facts.text, [
+const urineCheck = (facts: ClinicalFacts): RiskDraft | null => {
+  const words = matchedKeywords(facts.observationText, [
     "乏尿",
     "無尿",
     "尿量減少",
@@ -325,20 +381,20 @@ const urineRisk = (facts: ClinicalFacts): RiskDraft | null => {
     : "MEDIUM";
 
   const evidence: string[] = [];
-  if (count !== null) evidence.push(`排尿回数 ${count}回`);
+  if (count !== null) evidence.push(`入力された排尿回数 ${count}回`);
   if (words.length > 0) evidence.push(`記載: ${words.join("・")}`);
 
   return {
-    category: "尿量低下",
+    category: "排尿状況の確認",
     level,
     detail:
-      "尿量・排尿状況の低下がみられます。尿量測定と腹部膨満の確認、必要時は医師へ報告してください。",
+      "排尿に関する記載があります。排尿回数・尿量の記録と、腹部の状態に関する記載を確認してください。",
     evidence,
   };
 };
 
-const painRisk = (facts: ClinicalFacts): RiskDraft | null => {
-  const words = matchedKeywords(facts.text, [
+const painCheck = (facts: ClinicalFacts): RiskDraft | null => {
+  const words = matchedKeywords(facts.observationText, [
     "疼痛増強",
     "痛み強い",
     "疼痛",
@@ -351,44 +407,42 @@ const painRisk = (facts: ClinicalFacts): RiskDraft | null => {
   let level: RiskLevel = "LOW";
   const evidence: string[] = [];
   if (nrs !== null) {
-    evidence.push(`NRS ${nrs}`);
+    evidence.push(`入力されたNRS 最大 ${nrs}`);
     if (nrs >= 7) level = "HIGH";
     else if (nrs >= 4) level = "MEDIUM";
   }
-  if (matchedKeywords(facts.text, ["疼痛増強", "痛み強い"]).length > 0) {
+  if (matchedKeywords(facts.observationText, ["疼痛増強", "痛み強い"]).length > 0) {
     level = maxLevel(level, "MEDIUM");
   }
   if (level === "LOW") return null;
   if (words.length > 0) evidence.push(`記載: ${words.slice(0, 3).join("・")}`);
 
   return {
-    category: "疼痛増強",
+    category: "疼痛に関する確認",
     level,
     detail:
-      level === "HIGH"
-        ? "強い疼痛の訴えがあります。鎮痛剤の効果判定と、疼痛によるADL低下・睡眠障害に注意してください。"
-        : "疼痛のコントロールが必要です。鎮痛剤使用後の効果を評価してください。",
+      "疼痛に関する記載があります。疼痛スケールの推移と、入力済みの鎮痛剤使用に関する記載・使用後の記録を確認してください。",
     evidence,
   };
 };
 
-const circulationRisk = (facts: ClinicalFacts): RiskDraft | null => {
+const circulationCheck = (facts: ClinicalFacts): RiskDraft | null => {
   const evidence: string[] = [];
   let level: RiskLevel = "LOW";
-  let detail = "";
+  const parts: string[] = [];
 
   if (facts.systolicBp !== null) {
     if (facts.systolicBp < 90) {
       level = "HIGH";
-      detail = "収縮期血圧90mmHg未満です。循環動態の悪化に注意してください。";
+      parts.push(`入力された収縮期血圧は${facts.systolicBp}mmHgです。`);
       evidence.push(`収縮期血圧 ${facts.systolicBp}mmHg`);
     } else if (facts.systolicBp < 100) {
       level = maxLevel(level, "MEDIUM");
-      detail = "血圧が低めに推移しています。起立時の血圧低下に注意してください。";
+      parts.push(`入力された収縮期血圧は${facts.systolicBp}mmHgです。`);
       evidence.push(`収縮期血圧 ${facts.systolicBp}mmHg`);
     } else if (facts.systolicBp >= 180) {
       level = maxLevel(level, "MEDIUM");
-      detail = "血圧が高値です。医師指示の降圧基準を確認してください。";
+      parts.push(`入力された収縮期血圧は${facts.systolicBp}mmHgです。`);
       evidence.push(`収縮期血圧 ${facts.systolicBp}mmHg`);
     }
   }
@@ -396,26 +450,27 @@ const circulationRisk = (facts: ClinicalFacts): RiskDraft | null => {
   if (facts.pulse !== null) {
     if (facts.pulse >= 120 || facts.pulse < 45) {
       level = "HIGH";
-      detail = `${detail} 脈拍${facts.pulse}回/分と異常値です。`.trim();
+      parts.push(`入力された脈拍は${facts.pulse}回/分です。`);
       evidence.push(`脈拍 ${facts.pulse}回/分`);
     } else if (facts.pulse > 100) {
       level = maxLevel(level, "MEDIUM");
-      detail = `${detail} 頻脈傾向（${facts.pulse}回/分）です。`.trim();
+      parts.push(`入力された脈拍は${facts.pulse}回/分です。`);
       evidence.push(`脈拍 ${facts.pulse}回/分`);
     }
   }
 
   if (level === "LOW") return null;
+
   return {
-    category: "循環動態の変動",
+    category: "血圧・脈拍の確認",
     level,
-    detail: detail || "循環動態の変動に注意してください。",
+    detail: `${parts.join("")}単一の測定値のため、測定条件・平時値・推移と、入力済み医師指示との比較を確認してください。`,
     evidence,
   };
 };
 
-const consciousnessRisk = (facts: ClinicalFacts): RiskDraft | null => {
-  const words = matchedKeywords(facts.text, [
+const consciousnessCheck = (facts: ClinicalFacts): RiskDraft | null => {
+  const words = matchedKeywords(facts.observationText, [
     "せん妄",
     "不穏",
     "傾眠",
@@ -430,16 +485,16 @@ const consciousnessRisk = (facts: ClinicalFacts): RiskDraft | null => {
     ? "HIGH"
     : "MEDIUM";
   return {
-    category: "意識状態の変化",
+    category: "意識状態に関する確認",
     level,
     detail:
-      "意識状態の変化がみられます。JCS/GCSでの評価と、ライン自己抜去・転倒の二次リスクに注意してください。",
+      "意識状態に関する記載があります。前勤務との比較と、記録されている評価スケールの推移を確認してください。",
     evidence: [`記載: ${words.join("・")}`],
   };
 };
 
-const lineRisk = (facts: ClinicalFacts): RiskDraft | null => {
-  const lineWords = matchedKeywords(facts.text, [
+const lineCheck = (facts: ClinicalFacts): RiskDraft | null => {
+  const lineWords = matchedKeywords(facts.observationText, [
     "点滴",
     "ルート",
     "末梢",
@@ -449,7 +504,7 @@ const lineRisk = (facts: ClinicalFacts): RiskDraft | null => {
   ]);
   if (lineWords.length === 0) return null;
 
-  const trouble = matchedKeywords(facts.text, [
+  const trouble = matchedKeywords(facts.observationText, [
     "自己抜去",
     "漏れ",
     "腫脹",
@@ -462,22 +517,26 @@ const lineRisk = (facts: ClinicalFacts): RiskDraft | null => {
   const level: RiskLevel = trouble.length > 0 ? "HIGH" : "LOW";
 
   return {
-    category: "ルートトラブル",
+    category: "ルート・刺入部の確認",
     level,
     detail:
       level === "HIGH"
-        ? "ルートに関するトラブルの記載があります。刺入部の状態確認と再挿入の要否を確認してください。"
-        : "留置中のルートがあります。刺入部の発赤・腫脹・滴下状況を定期的に確認してください。",
+        ? "ルートに関する所見の記載があります。刺入部の状態と、入力済み医師指示・記録内容を確認してください。"
+        : "留置中のルートに関する記載があります。刺入部の状態と滴下状況の記録を確認してください。",
     evidence: [
-      `留置: ${lineWords.join("・")}`,
-      ...(trouble.length > 0 ? [`異常所見: ${trouble.join("・")}`] : []),
+      `留置に関する記載: ${lineWords.join("・")}`,
+      ...(trouble.length > 0 ? [`所見の記載: ${trouble.join("・")}`] : []),
     ],
   };
 };
 
-const allergyRisk = (input: HandoverInput, facts: ClinicalFacts): RiskDraft | null => {
+/**
+ * 登録アレルギー。
+ * 登録情報の提示にとどめ、禁忌薬・代替薬の提案は行わない。
+ */
+const allergyCheck = (input: HandoverInput, facts: ClinicalFacts): RiskDraft | null => {
   if (!hasAllergy(input.patient.allergies)) return null;
-  const drugMention = matchedKeywords(facts.text, [
+  const drugMention = matchedKeywords(facts.observationText, [
     "抗菌薬",
     "点滴",
     "内服",
@@ -487,9 +546,9 @@ const allergyRisk = (input: HandoverInput, facts: ClinicalFacts): RiskDraft | nu
   ]);
   const level: RiskLevel = drugMention.length > 0 ? "MEDIUM" : "LOW";
   return {
-    category: "アレルギー",
+    category: "登録アレルギーの確認",
     level,
-    detail: `アレルギー歴（${input.patient.allergies}）があります。新規薬剤の投与前に必ず確認してください。`,
+    detail: `登録アレルギー：${input.patient.allergies}。投薬前に登録アレルギー情報を確認してください。`,
     evidence: [
       `登録アレルギー: ${input.patient.allergies}`,
       ...(drugMention.length > 0 ? [`薬剤関連の記載: ${drugMention.join("・")}`] : []),
@@ -497,21 +556,21 @@ const allergyRisk = (input: HandoverInput, facts: ClinicalFacts): RiskDraft | nu
   };
 };
 
-const infectionRisk = (input: HandoverInput): RiskDraft | null => {
+const infectionCheck = (input: HandoverInput): RiskDraft | null => {
   const control = input.patient.infectionControl;
   if (!/飛沫|接触|空気|隔離/.test(control)) return null;
   return {
-    category: "感染対策",
+    category: "感染対策の確認",
     level: "MEDIUM",
-    detail: `${control}が指示されています。個人防護具の着脱手順を遵守してください。`,
+    detail: `登録されている感染対策：${control}。実施状況を確認してください。`,
     evidence: [`感染対策: ${control}`],
   };
 };
 
-const woundRisk = (facts: ClinicalFacts): RiskDraft | null => {
-  const site = matchedKeywords(facts.text, ["創部", "術後", "縫合", "ドレーン"]);
+const woundCheck = (facts: ClinicalFacts): RiskDraft | null => {
+  const site = matchedKeywords(facts.observationText, ["創部", "術後", "縫合", "ドレーン"]);
   if (site.length === 0) return null;
-  const abnormal = matchedKeywords(facts.text, [
+  const abnormal = matchedKeywords(facts.observationText, [
     "浸出液",
     "出血",
     "離開",
@@ -522,15 +581,16 @@ const woundRisk = (facts: ClinicalFacts): RiskDraft | null => {
   const level: RiskLevel = abnormal.length > 0 ? "MEDIUM" : "LOW";
   if (level === "LOW") return null;
   return {
-    category: "創部トラブル",
+    category: "創部の確認",
     level,
-    detail: "創部に異常所見の記載があります。ガーゼ汚染と感染徴候を観察してください。",
-    evidence: [`部位: ${site.join("・")}`, `所見: ${abnormal.join("・")}`],
+    detail:
+      "創部に関する所見の記載があります。創部の状態とガーゼの汚染に関する記録を確認してください。",
+    evidence: [`部位の記載: ${site.join("・")}`, `所見の記載: ${abnormal.join("・")}`],
   };
 };
 
-const glucoseRisk = (facts: ClinicalFacts): RiskDraft | null => {
-  const words = matchedKeywords(facts.text, [
+const glucoseCheck = (facts: ClinicalFacts): RiskDraft | null => {
+  const words = matchedKeywords(facts.observationText, [
     "低血糖",
     "高血糖",
     "インスリン",
@@ -542,31 +602,33 @@ const glucoseRisk = (facts: ClinicalFacts): RiskDraft | null => {
   let level: RiskLevel = "LOW";
   const evidence: string[] = [];
   if (value !== null) {
-    evidence.push(`血糖値 ${value}mg/dL`);
+    evidence.push(`入力された血糖値 ${value}mg/dL`);
     if (value < 70) level = "HIGH";
     else if (value >= 300) level = "MEDIUM";
   }
-  if (facts.text.includes("低血糖")) level = maxLevel(level, "HIGH");
+  if (facts.observationText.includes("低血糖")) level = maxLevel(level, "HIGH");
   else if (words.length > 0) level = maxLevel(level, "LOW");
   if (level === "LOW") return null;
   if (words.length > 0) evidence.push(`記載: ${words.join("・")}`);
 
   return {
-    category: "血糖変動",
+    category: "血糖値の確認",
     level,
-    detail: "血糖値の変動に注意が必要です。測定値と自覚症状を併せて観察してください。",
+    detail:
+      "血糖に関する記載があります。測定値の推移と、入力済み医師指示の実施状況を確認してください。",
     evidence,
   };
 };
 
-const deteriorationRisk = (risks: RiskDraft[]): RiskDraft | null => {
+/** HIGH が複数ある場合に、申し送り時の優先確認としてまとめる。 */
+const multipleHighCheck = (risks: RiskDraft[]): RiskDraft | null => {
   const highs = risks.filter((risk) => risk.level === "HIGH");
   if (highs.length < 2) return null;
   return {
-    category: "急変リスク",
+    category: "確認優先度HIGHの重複",
     level: "HIGH",
     detail:
-      "複数の高リスク項目が重なっています。バイタルサインの頻回測定と、早期の医師報告基準の共有を行ってください。",
+      "確認優先度HIGHの項目が複数あります。申し送り時にこれらを優先して確認し、入力済み医師指示の報告基準を次勤務者と共有してください。",
     evidence: highs.map((risk) => `${risk.category}: HIGH`),
   };
 };
@@ -575,33 +637,34 @@ export const detectRisks = (input: HandoverInput): RiskItem[] => {
   const facts = extractFacts(input);
   const drafts: RiskDraft[] = [];
 
-  const fever = feverRisk(facts);
-  const intake = intakeRisk(facts);
+  const temperature = temperatureCheck(facts);
+  const intake = intakeCheck(facts);
 
   const candidates = [
-    fever,
-    spo2Risk(facts),
-    respiratoryRisk(facts),
-    fallRisk(facts, input),
+    temperature,
+    spo2Check(facts),
+    respiratoryCheck(facts),
+    fallCheck(facts, input),
     intake,
-    dehydrationRisk(facts, fever?.level ?? null, intake?.level ?? null),
-    urineRisk(facts),
-    painRisk(facts),
-    circulationRisk(facts),
-    consciousnessRisk(facts),
-    lineRisk(facts),
-    woundRisk(facts),
-    glucoseRisk(facts),
-    allergyRisk(input, facts),
-    infectionRisk(input),
+    fluidBalanceCheck(facts, temperature?.level ?? null, intake?.level ?? null),
+    urineCheck(facts),
+    painCheck(facts),
+    circulationCheck(facts),
+    consciousnessCheck(facts),
+    lineCheck(facts),
+    woundCheck(facts),
+    glucoseCheck(facts),
+    allergyCheck(input, facts),
+    infectionCheck(input),
   ];
 
   for (const candidate of candidates) {
     if (candidate) drafts.push(candidate);
   }
 
-  const deterioration = deteriorationRisk(drafts);
-  if (deterioration) drafts.unshift(deterioration);
+  // まとめ項目は個別の確認候補より後ろに置く（ソートは安定なのでHIGH群の末尾になる）。
+  const multipleHigh = multipleHighCheck(drafts);
+  if (multipleHigh) drafts.push(multipleHigh);
 
   return drafts
     .sort((a, b) => compareLevelDesc(a.level, b.level))
@@ -618,33 +681,39 @@ export const detectRisks = (input: HandoverInput): RiskItem[] => {
 /* 次勤務への観察項目                                                  */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 確認候補ごとの観察項目。
+ * 観察頻度・投与開始などの新しい指示は含めず、「確認する」対象のみを並べる。
+ */
 const TASKS_BY_CATEGORY: Record<string, string[]> = {
-  "発熱・再発熱": ["再発熱の有無（体温を4時間ごとに測定）", "解熱剤使用後の効果判定"],
-  SpO2低下: ["SpO2の推移（安静時・労作時）", "酸素投与量と指示基準の確認"],
-  呼吸状態悪化: ["呼吸数・呼吸音・努力呼吸の有無", "喀痰の性状と自己喀出の可否"],
-  転倒リスク: [
-    "歩行時・立位時のふらつきの有無",
-    "転倒予防対策（ベッド柵・センサー・履物）の実施状況",
-    "夜間のトイレ移動時の付き添い",
+  "体温・再発熱の確認": ["再発熱の有無と体温の推移", "入力済み医師指示（解熱に関する記載）の実施状況"],
+  "SpO2値・推移の確認": [
+    "SpO2の推移（測定条件・酸素投与の有無を含む）",
+    "入力済みの酸素に関する指示基準と現在値の比較",
   ],
-  食事摂取低下: ["毎食の食事摂取量", "嚥下状態と食事形態の適合"],
-  脱水: ["水分摂取量と尿量のバランス", "口腔・皮膚の乾燥所見"],
-  尿量低下: ["排尿回数と尿量", "下腹部膨満・残尿感の有無"],
-  疼痛増強: ["疼痛スケール（NRS）の推移", "鎮痛剤使用後の効果と副作用"],
-  循環動態の変動: ["血圧・脈拍の推移", "起立時のふらつき・冷汗の有無"],
-  意識状態の変化: ["意識レベル（JCS）の評価", "夜間のせん妄・不穏の有無"],
-  ルートトラブル: ["点滴ルート刺入部の発赤・腫脹・漏れ", "指示された輸液の滴下状況"],
-  創部トラブル: ["創部の発赤・浸出液・ガーゼ汚染", "創部痛の程度"],
-  血糖変動: ["血糖測定値の推移", "低血糖症状（冷汗・動悸・意識レベル）の有無"],
-  アレルギー: ["新規薬剤投与前のアレルギー歴確認"],
-  感染対策: ["感染対策（個人防護具）の実施状況"],
-  急変リスク: ["バイタルサインの頻回測定と医師報告基準の確認"],
+  "呼吸状態の変化に関する確認": ["呼吸数・呼吸音・努力呼吸の有無", "喀痰の性状と自己喀出の可否"],
+  "転倒関連の確認": [
+    "移動・歩行時の状態（ふらつきの有無）",
+    "現在実施されている転倒予防対策の内容と実施状況",
+  ],
+  "食事摂取量の確認": ["食事摂取量の経過", "嚥下状態と入力済みの食事形態"],
+  "水分出納の確認": ["水分摂取量と尿量の記録", "口腔・皮膚の乾燥所見の記録"],
+  "排尿状況の確認": ["排尿回数と尿量の記録", "下腹部の張り・残尿感に関する訴えの有無"],
+  "疼痛に関する確認": ["疼痛スケール（NRS）の推移", "入力済みの鎮痛剤使用に関する記載と使用後の記録"],
+  "血圧・脈拍の確認": ["血圧・脈拍の推移と測定条件", "起立時のふらつき・冷汗に関する訴えの有無"],
+  "意識状態に関する確認": ["意識状態の前勤務との比較", "夜間の言動に関する記録"],
+  "ルート・刺入部の確認": ["点滴ルート刺入部の状態", "入力済み指示の輸液の滴下状況"],
+  "創部の確認": ["創部の状態とガーゼ汚染の有無", "創部痛に関する訴えの有無"],
+  "血糖値の確認": ["血糖測定値の推移", "低血糖に関連する自覚症状の訴えの有無"],
+  "登録アレルギーの確認": ["投薬前の登録アレルギー情報の確認"],
+  "感染対策の確認": ["登録されている感染対策の実施状況"],
+  // 「確認優先度HIGHの重複」はまとめ項目のため、観察項目は生成しない（重複を避ける）。
 };
 
 const BASELINE_TASKS = [
-  "バイタルサインの測定と前勤務値との比較",
+  "バイタルサインの値と前勤務値との比較",
   "食事摂取量・水分摂取量の記録",
-  "排泄回数と性状の確認",
+  "排泄回数と性状の記録",
 ];
 
 export const generateNextShiftTasks = (
@@ -671,20 +740,23 @@ export const generateNextShiftTasks = (
     }
   }
 
-  const doctorOrder = input.structured.doctorOrder.trim();
-  if (doctorOrder) {
-    push(`医師指示の実施・確認（${doctorOrder.slice(0, 40)}）`, "MEDIUM");
+  // 医師指示・検査は内容を切り詰めず、「入力済みの内容を確認する」項目として扱う。
+  if (input.structured.doctorOrder.trim()) {
+    push("入力済み医師指示の内容と実施状況の確認", "MEDIUM");
   }
-  const examination = input.structured.examination.trim();
-  if (examination) {
-    push(`予定されている検査の準備と結果確認（${examination.slice(0, 30)}）`, "MEDIUM");
+  if (input.structured.examination.trim()) {
+    push("入力済みの検査予定の準備と結果の確認", "MEDIUM");
   }
-  const family = input.structured.family.trim();
-  if (family) push("家族対応の申し送り内容の確認", "LOW");
+  if (input.structured.family.trim()) {
+    push("入力済みの家族対応内容の確認", "LOW");
+  }
 
   for (const label of BASELINE_TASKS) push(label, "LOW");
 
-  return tasks.slice(0, 14);
+  // 確認優先度の高い順に並べ替えてから件数を制限する。
+  return tasks
+    .sort((a, b) => compareLevelDesc(a.priority, b.priority))
+    .slice(0, 14);
 };
 
 /* ------------------------------------------------------------------ */
@@ -713,10 +785,7 @@ const keySentences = (freeText: string, limit: number): string[] =>
     .filter((sentence) => sentence.length > 0)
     .slice(0, limit);
 
-export const generateSbar = (
-  input: HandoverInput,
-  risks: RiskItem[],
-): Sbar => {
+export const generateSbar = (input: HandoverInput, risks: RiskItem[]): Sbar => {
   const { patient, structured, freeText } = input;
   const facts = extractFacts(input);
   const vitals = vitalsLine(facts, input);
@@ -724,47 +793,58 @@ export const generateSbar = (
 
   const situationParts = [
     `${patient.room} ${patient.name}さん（${patient.age}歳・${genderLabel(patient.gender)}）。`,
-    vitals ? `現在のバイタルは${vitals}。` : "",
+    vitals ? `入力された直近のバイタルは${vitals}。` : "",
     ...keySentences(freeText, 3).map((sentence) => `${sentence}。`),
     topRisks.length > 0
-      ? `現時点で最も注意すべきは${topRisks.map((risk) => `${risk.category}（${risk.level}）`).join("、")}です。`
+      ? `申し送り時に優先して確認する項目は${topRisks
+          .map((risk) => `${risk.category}（${risk.level}）`)
+          .join("、")}です。`
       : "",
   ];
 
   const backgroundParts = [
     `${formatJaDate(patient.admissionDate)}に${patient.primaryDiagnosis}で入院。主治医は${patient.attendingDoctor}。`,
     `ADLは${patient.adl}。`,
-    `アレルギー: ${patient.allergies || "情報なし"}。コードステータス: ${patient.codeStatus}。`,
+    `登録アレルギー: ${hasAllergy(patient.allergies) ? patient.allergies : "登録なし"}。コードステータス: ${patient.codeStatus}。`,
     `感染対策: ${patient.infectionControl}。`,
-    structured.medication.trim() ? `内服・注射: ${structured.medication.trim()}。` : "",
-    structured.treatment.trim() ? `実施中の処置: ${structured.treatment.trim()}。` : "",
+    structured.medication.trim() ? `内服・注射（入力内容）: ${structured.medication.trim()}。` : "",
+    structured.treatment.trim() ? `実施中の処置（入力内容）: ${structured.treatment.trim()}。` : "",
   ];
 
-  const assessmentParts =
-    risks.length > 0
-      ? risks
-          .slice(0, 5)
-          .map((risk) => `【${risk.level}】${risk.category}: ${risk.detail}`)
-      : ["現時点で特記すべきリスクは抽出されていません。継続して経過を観察してください。"];
+  const assessmentParts = [
+    "以下は入力情報から抽出した確認候補です（医学的な評価の確定ではありません）。",
+    ...(risks.length > 0
+      ? risks.slice(0, 5).map((risk) => `【${risk.level}】${risk.category}: ${risk.detail}`)
+      : ["入力情報からは特記すべき確認候補は抽出されませんでした。継続して経過を確認してください。"]),
+  ];
 
+  // Recommendation は「入力済みの医師指示」と「次勤務での確認候補」のみで構成する。
+  // 医師指示は原文のまま引用し、AIが新しい指示を作らない。
   const recommendationParts = [
-    structured.doctorOrder.trim()
-      ? `医師指示: ${structured.doctorOrder.trim()}`
-      : "",
+    "【入力済みの医師指示（入力内容をそのまま記載）】",
+    structured.doctorOrder.trim() || "（入力なし）",
+    "",
+    "【次勤務での確認候補】",
     ...generateNextShiftTasks(input, risks)
       .slice(0, 6)
       .map((task) => `・${task.label}`),
-    structured.family.trim() ? `家族対応: ${structured.family.trim()}` : "",
+    ...(structured.family.trim()
+      ? ["", "【家族対応（入力内容）】", structured.family.trim()]
+      : []),
   ];
 
   return {
     situation: situationParts.filter(Boolean).join(""),
     background: backgroundParts.filter(Boolean).join(""),
     assessment: assessmentParts.join("\n"),
-    recommendation: recommendationParts.filter(Boolean).join("\n"),
+    recommendation: recommendationParts.join("\n"),
   };
 };
 
+/**
+ * 口頭申し送り用の要約。
+ * 患者識別 → 主病名 → 直近の変化 → 現在状態 → 入力済み医師指示 → 確認候補 の順に整理する。
+ */
 export const generateBriefSummary = (
   input: HandoverInput,
   risks: RiskItem[],
@@ -773,20 +853,28 @@ export const generateBriefSummary = (
   const facts = extractFacts(input);
   const vitals = vitalsLine(facts, input);
   const highlights = keySentences(freeText, 2);
-  const topRisks = risks.filter((risk) => risk.level !== "LOW").slice(0, 2);
   const topTasks = generateNextShiftTasks(input, risks).slice(0, 3);
 
   const sentences = [
+    // 患者識別・主病名
     `${patient.room}、${patient.name}さん、${patient.age}歳${genderLabel(patient.gender)}、${patient.primaryDiagnosis}で${formatJaDate(patient.admissionDate)}入院です。`,
+    // 重要な直近変化
     highlights.length > 0 ? `${highlights.join("。")}。` : "",
-    vitals ? `現在のバイタルは${vitals}です。` : "",
+    // 現在状態
+    vitals ? `入力された直近のバイタルは${vitals}です。` : "",
     structured.mealIntake.trim() ? `食事は${structured.mealIntake.trim()}。` : "",
     structured.infusion.trim() ? `点滴は${structured.infusion.trim()}。` : "",
-    topRisks.length > 0
-      ? `注意点は${topRisks.map((risk) => `${risk.category}（${risk.level}）`).join("と")}です。`
+    hasAllergy(patient.allergies)
+      ? `登録アレルギーは${patient.allergies}です。`
       : "",
+    // 入力済み医師指示（原文のまま）
+    structured.doctorOrder.trim()
+      ? `入力済みの医師指示は「${structured.doctorOrder.trim()}」です。`
+      : "",
+    // 次勤務への確認候補（確認優先度の一覧は High Priority / 確認優先度セクションで提示するため、
+    // 要約では重複させず確認候補のみを述べる）
     topTasks.length > 0
-      ? `次勤務では${topTasks.map((task) => task.label).join("、")}をお願いします。`
+      ? `次勤務での確認候補は、${topTasks.map((task) => task.label).join("、")}です。`
       : "",
   ];
 

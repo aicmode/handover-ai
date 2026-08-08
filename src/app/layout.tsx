@@ -12,12 +12,17 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
-    <html lang="ja" className="h-full antialiased" suppressHydrationWarning>
+    <html lang="ja" className="antialiased" suppressHydrationWarning>
       <head>
         {/* ハイドレーション前にテーマを適用してちらつきを防ぐ */}
         <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
       </head>
-      <body className="flex min-h-full flex-col">
+      {/*
+        `<html>` に height:100% を持たせると、スクロール領域の高さが
+        ビューポート固定になり sticky ヘッダーのオフセット計算が崩れる。
+        ページ全体の最低高さは body 側の min-h-screen で確保する。
+      */}
+      <body className="flex min-h-screen flex-col">
         <ToastProvider>
           <AppHeader />
           <main className="mx-auto w-full max-w-[1600px] flex-1 px-4 py-5 lg:px-6">

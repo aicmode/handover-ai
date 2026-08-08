@@ -18,6 +18,7 @@ export function SafetyNotice({ className }: { className?: string }) {
         <div className="space-y-1">
           <p>
             Handover AIは看護申し送りを支援するプロトタイプです。AI生成内容は参考情報であり、最終的な判断・確認は医療従事者が行ってください。
+            AIは診断・治療・看護判断を代替しません。入力された情報を整理し、確認候補を提示するだけの支援システムです。
           </p>
           <p className="font-semibold">
             実在患者の個人情報を入力しないでください。本アプリのデータはすべて架空のものです。

@@ -43,12 +43,12 @@ export function AppHeader() {
 
   return (
     <header className="sticky top-0 z-40 border-b border-black/20 bg-header text-header-fg">
-      <div className="mx-auto flex h-16 max-w-[1600px] items-center justify-between gap-4 px-4 lg:px-6">
-        <Link href="/" className="flex items-center gap-3">
-          <span className="flex h-9 w-9 items-center justify-center rounded border border-white/20 bg-white/10">
+      <div className="mx-auto flex h-[var(--header-h)] max-w-[1600px] items-center justify-between gap-4 px-4 lg:px-6">
+        <Link href="/" className="flex min-w-0 items-center gap-3">
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded border border-white/20 bg-white/10">
             <Activity size={18} aria-hidden />
           </span>
-          <span className="leading-tight">
+          <span className="min-w-0 leading-tight">
             <span className="block text-base font-semibold tracking-wide">
               Handover AI
             </span>

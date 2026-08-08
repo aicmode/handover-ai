@@ -50,8 +50,8 @@ export function SummaryCards({
       accent: "text-warn",
     },
     {
-      label: "要注意患者",
-      sublabel: "High Risk",
+      label: "要確認患者",
+      sublabel: "High Priority",
       value: attention,
       icon: AlertTriangle,
       accent: "text-danger",

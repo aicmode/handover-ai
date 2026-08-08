@@ -16,7 +16,7 @@ const FILTERS: Array<{ id: Filter; label: string }> = [
   { id: "all", label: "すべて" },
   { id: "pending", label: "未完了" },
   { id: "completed", label: "完了" },
-  { id: "attention", label: "要注意" },
+  { id: "attention", label: "要確認（HIGH）" },
 ];
 
 export function DashboardView() {
@@ -39,17 +39,27 @@ export function DashboardView() {
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <h1 className="flex items-center gap-2 text-lg font-semibold text-fg">
-            <LayoutDashboard size={18} className="text-brand" aria-hidden />
+      {/*
+        見出しと説明文は1つのブロックにまとめ、操作ボタンとは
+        別の行に折り返せるようにする（狭い幅で説明文が潰れないようにするため）。
+      */}
+      <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+        <div className="min-w-0 flex-1 basis-72">
+          <h1 className="flex items-center gap-2 text-lg font-semibold leading-7 text-fg">
+            <LayoutDashboard size={18} className="shrink-0 text-brand" aria-hidden />
             Dashboard
           </h1>
-          <p className="mt-0.5 text-xs text-fg-muted">
+          <p className="mt-1 text-xs leading-relaxed text-fg-muted">
             本日の担当患者と申し送り状況の一覧です。患者を選択すると申し送り画面に移動します。
           </p>
         </div>
-        <Button type="button" variant="ghost" size="sm" onClick={handleReset}>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={handleReset}
+          className="shrink-0"
+        >
           <RotateCcw size={14} aria-hidden />
           デモデータに戻す
         </Button>
@@ -69,7 +79,7 @@ export function DashboardView() {
           title="患者一覧"
           description={
             hydrated
-              ? `${visible.length}件を表示中（全${patients.length}件）`
+              ? `${visible.length}件を表示中（全${patients.length}件） / 確認優先度は申し送り時に確認する優先度であり、医学的重症度ではありません`
               : "読み込み中..."
           }
           actions={

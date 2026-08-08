@@ -16,7 +16,7 @@ export function BriefSummaryCard({
     <Card>
       <CardHeader
         title="Brief Summary"
-        description="口頭申し送り用の要約（30〜60秒目安）。編集できます。"
+        description="口頭申し送り用の要約（30〜60秒目安）。患者識別→主病名→直近の変化→現在状態→入力済み医師指示→確認候補の順。編集できます。"
         icon={<FileText size={16} aria-hidden />}
         actions={
           <CopyButton
